@@ -40,5 +40,3 @@ Build a real-time demo that:
 3. Select target label
 4. Observe overlay + spoken directions
 
-## Notes
-This MVP is intentionally narrow: stability > feature count.
