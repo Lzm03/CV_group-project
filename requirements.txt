@@ -1,0 +1,7 @@
+opencv-python
+ultralytics
+mediapipe
+numpy
+sounddevice
+requests
+python-dotenv
