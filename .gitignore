@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.venv/
+.coverage
+.pytest_cache/
+pytest-cache-files-*/
+hand_landmarker.task
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

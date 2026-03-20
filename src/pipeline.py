@@ -1,3 +1,5 @@
+import logging
+
 import cv2
 
 from audio import AudioGuide
@@ -30,12 +32,29 @@ from phrases import (
 from speech_input import SpeechInput
 
 
+logger = logging.getLogger(__name__)
+
+MISSING_TARGET_PROMPT = "Please tell me which object you want first."
+GRASP_CONFIRMATION_UNAVAILABLE = (
+    "I cannot confirm whether you are holding the {target} yet. Please keep it in view and ask me again."
+)
+GRASP_DISTANCE_RATIO = 0.9
+GRASP_OVERLAP_THRESHOLD = 0.25
+RAW_DETECTION_LIMIT = 8
+HEARD_TEXT_MAX_LEN = 52
+ANSWER_TEXT_MAX_LEN = 68
+HAND_TRACKER_UNAVAILABLE = (
+    "Hand tracking is unavailable right now, so I cannot guide your hand position yet. "
+    "Please check the MediaPipe setup and try again."
+)
+
+
 class QuerySnapshotPipeline:
     def __init__(self, config):
         self.config = config
         self.current_target_label = None
         self.detector = TargetDetector(config.yolo_model, config.target_labels, config.detection_confidence)
-        self.hand_tracker = HandTracker()
+        self.hand_tracker = HandTracker(config.hand_landmarker_model)
         self.audio = AudioGuide(
             config.speech_cooldown_sec,
             enabled=config.use_tts,
@@ -43,7 +62,7 @@ class QuerySnapshotPipeline:
             minimax_voice_id=config.minimax_voice_id,
             minimax_model=config.minimax_model,
         )
-        self.speech_input = SpeechInput()
+        self.speech_input = SpeechInput(seconds=config.speech_input_seconds)
         self.nlu = SimpleNLU(config)
         self.last_scene_objects = []
         self.last_heard_text = ""
@@ -60,6 +79,75 @@ class QuerySnapshotPipeline:
         self.live_hand_box = None
         self.live_hand_landmarks = None
 
+    def _respond(self, message: str):
+        self.last_answer = message
+        self.audio.speak(message)
+        return message
+
+    def _set_current_target(self, target_label=None):
+        if target_label:
+            self.current_target_label = self.config.normalize_target(target_label)
+        return self.current_target_label
+
+    def _require_target_label(self, target_label=None):
+        current_target = self._set_current_target(target_label)
+        if current_target:
+            return current_target
+        self._respond(MISSING_TARGET_PROMPT)
+        return None
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    @staticmethod
+    def _unique_scene_labels(detections):
+        labels = []
+        seen = set()
+        for detection in detections:
+            label = detection["label"]
+            if label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
+        return labels
+
+    @staticmethod
+    def _format_raw_detections(detections):
+        if not detections:
+            return "none"
+        return ", ".join(
+            f"{detection['label']}({detection['confidence']:.2f})"
+            for detection in detections[:RAW_DETECTION_LIMIT]
+        )
+
+    def _direction_context(self, target, hand_center):
+        tx, ty = target["center"]
+        hx, hy = hand_center
+        dx, dy = tx - hx, ty - hy
+        manhattan = abs(dx) + abs(dy)
+        return {
+            "dx": dx,
+            "dy": dy,
+            "manhattan": manhattan,
+            "clock": to_clock_direction(dx, dy),
+            "cardinal": to_cardinal_direction(dx, dy, self.config.x_threshold, self.config.y_threshold),
+            "movement": movement_instruction(dx, dy, self.config.x_threshold, self.config.y_threshold),
+            "approx_cm": estimate_distance_cm(dx, dy, self.config.approx_cm_per_pixel),
+            "distance": distance_phrase(manhattan, self.config.near_threshold),
+        }
+
+    def _hand_tracking_unavailable(self):
+        return not getattr(self.hand_tracker, "available", False)
+
+    def _hand_tracking_message(self):
+        detail = getattr(self.hand_tracker, "error_message", "")
+        if detail:
+            logger.warning("Hand tracking unavailable: %s", detail)
+        return HAND_TRACKER_UNAVAILABLE
+
     def _hand_box_from_landmarks(self, frame, hand_landmarks):
         if not hand_landmarks:
             return None
@@ -71,7 +159,12 @@ class QuerySnapshotPipeline:
 
     def update_live_state(self, frame):
         detections = self.detector.detect_all(frame, restrict_to_allowed=True)
-        detections = [d for d in detections if d['label'] not in self.config.ignored_scene_labels]
+        detections = [
+            detection
+            for detection in detections
+            if detection["label"] not in self.config.ignored_scene_labels
+        ]
+        detections = sorted(detections, key=lambda x: x["confidence"], reverse=True)
         hand_center, hand_landmarks = self.hand_tracker.detect(frame)
         hand_box = self._hand_box_from_landmarks(frame, hand_landmarks)
 
@@ -79,31 +172,22 @@ class QuerySnapshotPipeline:
         self.live_hand_center = hand_center
         self.live_hand_landmarks = hand_landmarks
         self.live_hand_box = hand_box
-        self.last_snapshot = frame.copy()
+        self.last_snapshot = frame
         self.last_snapshot_detections = detections
         self.last_snapshot_hand_center = hand_center
         self.last_snapshot_hand_box = hand_box
         self.last_snapshot_hand_landmarks = hand_landmarks
 
-        labels = []
-        seen = set()
-        for d in sorted(detections, key=lambda x: x['confidence'], reverse=True):
-            if d['label'] not in seen:
-                seen.add(d['label'])
-                labels.append(d['label'])
-        self.last_scene_objects = labels
-        self.last_raw_detection_text = ', '.join(
-            [f"{d['label']}({d['confidence']:.2f})" for d in sorted(detections, key=lambda x: x['confidence'], reverse=True)[:8]]
-        ) if detections else 'none'
+        self.last_scene_objects = self._unique_scene_labels(detections)
+        self.last_raw_detection_text = self._format_raw_detections(detections)
 
     def _best_target(self, detections, label):
         if not label:
             return None
-        candidates = [d for d in detections if d['label'] == label]
+        candidates = [d for d in detections if d["label"] == label]
         if not candidates:
             return None
-        candidates.sort(key=lambda x: (x['area'], x['confidence']), reverse=True)
-        return candidates[0]
+        return max(candidates, key=lambda x: (x["area"], x["confidence"]))
 
     def answer_scene_summary(self):
         labels = self.last_scene_objects
@@ -114,117 +198,83 @@ class QuerySnapshotPipeline:
         else:
             objects_text = ', '.join(labels[:-1]) + f", and {labels[-1]}"
             msg = pick(SCENE_MANY).format(objects=objects_text)
-        self.last_answer = msg
-        self.audio.speak(msg)
-        return msg
+        return self._respond(msg)
 
     def answer_direction(self, target_label=None):
-        detections = self.live_detections
-        hand_center = self.live_hand_center
-        if target_label:
-            self.current_target_label = self.config.normalize_target(target_label)
-        if not self.current_target_label:
-            msg = "Please tell me which object you want first."
-            self.last_answer = msg
-            self.audio.speak(msg)
-            return msg
-        target = self._best_target(detections, self.current_target_label)
-        if target is None:
-            msg = pick(DIRECTION_NO_TARGET).format(target=self.current_target_label)
-            self.last_answer = msg
-            self.audio.speak(msg)
-            return msg
-        if hand_center is None:
-            msg = pick(SHOW_HAND).format(target=self.current_target_label)
-            self.last_answer = msg
-            self.audio.speak(msg)
-            return msg
+        current_target = self._require_target_label(target_label)
+        if current_target is None:
+            return self.last_answer
 
-        tx, ty = target['center']
-        hx, hy = hand_center
-        dx, dy = tx - hx, ty - hy
-        dist = abs(dx) + abs(dy)
-        clock = to_clock_direction(dx, dy)
-        cardinal = to_cardinal_direction(dx, dy, self.config.x_threshold, self.config.y_threshold)
-        movement = movement_instruction(dx, dy, self.config.x_threshold, self.config.y_threshold)
-        approx_cm = estimate_distance_cm(dx, dy, self.config.approx_cm_per_pixel)
+        target = self._best_target(self.live_detections, current_target)
+        if target is None:
+            return self._respond(pick(DIRECTION_NO_TARGET).format(target=current_target))
+        if self._hand_tracking_unavailable():
+            return self._respond(self._hand_tracking_message())
+        if self.live_hand_center is None:
+            return self._respond(pick(SHOW_HAND).format(target=current_target))
+
+        context = self._direction_context(target, self.live_hand_center)
         msg = pick(DIRECTION_REPLY).format(
-            target=self.current_target_label,
-            clock=clock,
-            cardinal=cardinal,
-            movement=movement,
-            approx_cm=approx_cm,
-            distance=distance_phrase(dist, self.config.near_threshold),
+            target=current_target,
+            clock=context["clock"],
+            cardinal=context["cardinal"],
+            movement=context["movement"],
+            approx_cm=context["approx_cm"],
+            distance=context["distance"],
             follow=pick(FOLLOW_UP),
         )
-        self.last_answer = msg
-        self.audio.speak(msg)
-        return msg
+        return self._respond(msg)
 
     def answer_grasp_status(self, target_label=None):
-        detections = self.live_detections
-        hand_center = self.live_hand_center
-        hand_box = self.live_hand_box
-        if target_label:
-            self.current_target_label = self.config.normalize_target(target_label)
-        if not self.current_target_label:
-            msg = "Please tell me which object you want first."
-            self.last_answer = msg
-            self.audio.speak(msg)
-            return msg
-        target = self._best_target(detections, self.current_target_label)
-        if target is None or hand_center is None or hand_box is None:
-            msg = f"I cannot confirm whether you are holding the {self.current_target_label} yet. Please keep it in view and ask me again."
-            self.last_answer = msg
-            self.audio.speak(msg)
-            return msg
+        current_target = self._require_target_label(target_label)
+        if current_target is None:
+            return self.last_answer
 
-        tx, ty = target['center']
-        hx, hy = hand_center
-        dist = abs(tx - hx) + abs(ty - hy)
-        ov = overlap_ratio(hand_box, target['bbox'])
-        if dist < self.config.near_threshold * 0.9 or ov > 0.25:
-            msg = pick(GRASP_YES).format(target=self.current_target_label, follow=pick(FOLLOW_UP))
-        else:
-            dx, dy = tx - hx, ty - hy
-            clock = to_clock_direction(dx, dy)
-            cardinal = to_cardinal_direction(dx, dy, self.config.x_threshold, self.config.y_threshold)
-            movement = movement_instruction(dx, dy, self.config.x_threshold, self.config.y_threshold)
-            approx_cm = estimate_distance_cm(dx, dy, self.config.approx_cm_per_pixel)
-            msg = pick(GRASP_NO).format(
-                target=self.current_target_label,
-                clock=clock,
-                cardinal=cardinal,
-                movement=movement,
-                approx_cm=approx_cm,
+        target = self._best_target(self.live_detections, current_target)
+        if target is None or self.live_hand_center is None or self.live_hand_box is None:
+            if self._hand_tracking_unavailable():
+                return self._respond(self._hand_tracking_message())
+            return self._respond(GRASP_CONFIRMATION_UNAVAILABLE.format(target=current_target))
+
+        context = self._direction_context(target, self.live_hand_center)
+        overlap = overlap_ratio(self.live_hand_box, target["bbox"])
+        if (
+            context["manhattan"] < self.config.near_threshold * GRASP_DISTANCE_RATIO
+            or overlap > GRASP_OVERLAP_THRESHOLD
+        ):
+            return self._respond(
+                pick(GRASP_YES).format(target=current_target, follow=pick(FOLLOW_UP))
             )
-        self.last_answer = msg
-        self.audio.speak(msg)
-        return msg
+
+        msg = pick(GRASP_NO).format(
+            target=current_target,
+            clock=context["clock"],
+            cardinal=context["cardinal"],
+            movement=context["movement"],
+            approx_cm=context["approx_cm"],
+        )
+        return self._respond(msg)
 
     def handle_voice_text(self, text):
         self.last_heard_text = text or ""
         self.last_voice_status = "heard"
-        print(f"[HEARD] {self.last_heard_text}")
+        logger.info("Heard: %s", self.last_heard_text)
         result = self.nlu.parse(text)
         self.audio.speak(pick(CHECKING))
-        if result.intent == 'scene_summary':
-            self.last_voice_status = 'understood: scene_summary'
+        if result.intent == "scene_summary":
+            self.last_voice_status = "understood: scene_summary"
             return self.answer_scene_summary()
-        if result.intent == 'select_target':
+        if result.intent == "select_target":
             self.last_voice_status = f"understood: select_target ({result.target})"
             return self.answer_direction(result.target)
-        if result.intent == 'ask_direction':
+        if result.intent == "ask_direction":
             self.last_voice_status = f"understood: ask_direction ({result.target})"
             return self.answer_direction(result.target)
-        if result.intent == 'ask_grasp_status':
+        if result.intent == "ask_grasp_status":
             self.last_voice_status = f"understood: ask_grasp_status ({result.target})"
             return self.answer_grasp_status(result.target)
-        self.last_voice_status = 'not understood'
-        msg = pick(UNKNOWN)
-        self.last_answer = msg
-        self.audio.speak(msg)
-        return msg
+        self.last_voice_status = "not understood"
+        return self._respond(pick(UNKNOWN))
 
     def listen_for_command(self):
         self.audio.speak(pick(LISTENING))
@@ -232,10 +282,11 @@ class QuerySnapshotPipeline:
         if err:
             self.last_voice_status = f"voice error: {err}"
             self.last_heard_text = ""
+            logger.warning("Voice input failed: %s", err)
+            if not self.speech_input.is_available():
+                return None, err
             msg = f"Voice input failed: {err}"
-            print(f"[VOICE ERROR] {err}")
-            self.audio.speak(msg)
-            return None, msg
+            return None, self._respond(msg)
         return text, None
 
     def draw_status(self, frame):
@@ -247,21 +298,45 @@ class QuerySnapshotPipeline:
             cv2.rectangle(display, (x1, y1), (x2, y2), (90, 90, 90), 1)
             cv2.putText(display, det['label'], (x1, max(20, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
 
-        if self.live_hand_landmarks and self.hand_tracker.drawer:
-            self.hand_tracker.drawer.draw_landmarks(display, self.live_hand_landmarks, self.hand_tracker.hand_connections)
+        if self.live_hand_landmarks:
+            self._draw_hand_landmarks(display, self.live_hand_landmarks)
         if self.live_hand_center:
             cv2.circle(display, self.live_hand_center, 12, (255, 0, 0), -1)
             cv2.circle(display, self.live_hand_center, 18, (255, 200, 0), 2)
-            cv2.putText(display, 'hand', (self.live_hand_center[0] + 14, self.live_hand_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+            cv2.putText(display, "hand", (self.live_hand_center[0] + 14, self.live_hand_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
         cv2.rectangle(display, (10, 10), (920, 108), (25, 25, 25), -1)
-        target_text = self.current_target_label if self.current_target_label else 'none'
-        scene_text = ', '.join(self.last_scene_objects) if self.last_scene_objects else 'none'
-        heard = (self.last_heard_text[:52] + '...') if len(self.last_heard_text) > 52 else self.last_heard_text
-        answer = (self.last_answer[:68] + '...') if len(self.last_answer) > 68 else self.last_answer
-        hand_status = 'OK' if self.live_hand_center is not None else 'MISSING'
-        cv2.putText(display, f"Hand: {hand_status}   Target: {target_text}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        cv2.putText(display, f"Objects: {scene_text}", (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200,200,200), 1)
-        cv2.putText(display, f"Heard: {heard if heard else 'none'}", (20, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220,220,120), 1)
-        cv2.putText(display, f"Answer: {answer if answer else 'none'}", (20, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80,220,255), 1)
+        target_text = self.current_target_label if self.current_target_label else "none"
+        scene_text = ", ".join(self.last_scene_objects) if self.last_scene_objects else "none"
+        heard = self._truncate_text(self.last_heard_text, HEARD_TEXT_MAX_LEN)
+        answer = self._truncate_text(self.last_answer, ANSWER_TEXT_MAX_LEN)
+        if self._hand_tracking_unavailable():
+            hand_status = "UNAVAILABLE"
+        else:
+            hand_status = "OK" if self.live_hand_center is not None else "MISSING"
+        cv2.putText(display, f"Hand: {hand_status}   Target: {target_text}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(display, f"Objects: {scene_text}", (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+        cv2.putText(display, f"Heard: {heard if heard else 'none'}", (20, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 120), 1)
+        cv2.putText(display, f"Answer: {answer if answer else 'none'}", (20, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80, 220, 255), 1)
         return display
+
+    def _draw_hand_landmarks(self, frame, hand_landmarks):
+        points = [
+            (int(landmark.x * frame.shape[1]), int(landmark.y * frame.shape[0]))
+            for landmark in hand_landmarks.landmark
+        ]
+        for point in points:
+            cv2.circle(frame, point, 3, (0, 255, 255), -1)
+
+        for connection in self.hand_tracker.hand_connections or ():
+            start_index = getattr(connection, "start", None)
+            end_index = getattr(connection, "end", None)
+            if start_index is None or end_index is None:
+                start_index, end_index = connection
+            if start_index >= len(points) or end_index >= len(points):
+                continue
+            cv2.line(frame, points[start_index], points[end_index], (0, 180, 255), 2)
+
+    def close(self):
+        self.hand_tracker.close()
+        self.audio.close()

@@ -1,7 +1,8 @@
-opencv-python
-ultralytics
-mediapipe
-numpy
-sounddevice
-requests
-python-dotenv
+mediapipe==0.10.32
+numpy==2.4.3
+opencv-python==4.13.0.92
+pyttsx3==2.99
+python-dotenv==1.2.2
+requests==2.32.5
+sounddevice==0.5.5
+ultralytics==8.4.21

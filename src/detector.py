@@ -1,13 +1,25 @@
+import logging
+from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
+
+
 class TargetDetector:
     def __init__(self, model_name: str, allowed_labels: tuple[str, ...], confidence: float = 0.35):
         self.allowed_labels = set(allowed_labels)
         self.confidence = confidence
         self.model = None
+        model_path = Path(model_name)
+        if not model_path.is_absolute():
+            local_model_path = Path(__file__).resolve().parent / model_path
+            if local_model_path.exists():
+                model_path = local_model_path
         try:
             from ultralytics import YOLO
-            self.model = YOLO(model_name)
+            self.model = YOLO(str(model_path))
         except Exception as e:
-            print(f"[WARN] YOLO not ready: {e}")
+            logger.warning("YOLO not ready: %s", e)
 
     def _run(self, frame, restrict_to_allowed: bool = True):
         if self.model is None:
@@ -35,7 +47,7 @@ class TargetDetector:
                         "area": area,
                     })
         except Exception as e:
-            print(f"[WARN] detection failed: {e}")
+            logger.warning("Detection failed: %s", e)
         return candidates
 
     def detect_all(self, frame, restrict_to_allowed: bool = True):

@@ -1,6 +1,11 @@
 import math
 
 
+WITHIN_REACH_RATIO = 0.8
+VERY_CLOSE_RATIO = 1.5
+A_LITTLE_FAR_RATIO = 2.5
+
+
 def to_clock_direction(dx: float, dy: float) -> str:
     # Flip horizontal axis to match the user's real-world movement direction.
     # 12 o'clock = up, 3 = right, 6 = down, 9 = left
@@ -54,11 +59,11 @@ def estimate_distance_cm(dx: float, dy: float, cm_per_pixel: float) -> float:
 
 
 def distance_phrase(distance: float, near_threshold: float) -> str:
-    if distance < near_threshold * 0.8:
+    if distance < near_threshold * WITHIN_REACH_RATIO:
         return "within reach"
-    if distance < near_threshold * 1.5:
+    if distance < near_threshold * VERY_CLOSE_RATIO:
         return "very close"
-    if distance < near_threshold * 2.5:
+    if distance < near_threshold * A_LITTLE_FAR_RATIO:
         return "a little far"
     return "far"
 
