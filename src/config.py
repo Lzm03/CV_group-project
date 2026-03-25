@@ -26,6 +26,18 @@ class AppConfig:
     snapshot_burst_count: int = 5
     debug: bool = False
     hand_landmarker_model: str = "hand_landmarker.task"
+    # Known real-world widths (cm) for bbox-based scale auto-calibration.
+    # Objects not listed here fall back to approx_cm_per_pixel.
+    known_object_widths_cm: dict[str, float] = field(default_factory=lambda: {
+        "cup": 8.5,         # typical mug diameter
+        "cell phone": 7.2,  # typical smartphone width
+        "paper": 21.0,      # A4 width
+    })
+    # Detection method backends (used for multi-method comparison)
+    detector_backend: str = "yolo11s"       # yolo11s | yolo8n | yolo8s | yolo8m | ssd
+    hand_tracker_backend: str = "mediapipe" # mediapipe | yolo_pose | holistic
+    depth_estimator_backend: str = "pixel"  # pixel | midas
+    depth_update_every_n_frames: int = 3
     ignored_scene_labels: frozenset[str] = field(default_factory=lambda: frozenset({"person"}))
     label_aliases: dict[str, str] = field(default_factory=lambda: {
         "phone": "cell phone",
@@ -70,6 +82,15 @@ class AppConfig:
                 raise ValueError(f"{field_name} must be positive")
         if self.tts_provider not in {"auto", "pyttsx3", "minimax", "say"}:
             raise ValueError("tts_provider must be one of: auto, pyttsx3, minimax, say")
+        valid_detectors = {"yolo11s", "yolo8n", "yolo8s", "yolo8m", "ssd"}
+        if self.detector_backend not in valid_detectors:
+            raise ValueError(f"detector_backend must be one of: {valid_detectors}")
+        if self.hand_tracker_backend not in {"mediapipe", "yolo_pose", "holistic"}:
+            raise ValueError("hand_tracker_backend must be one of: mediapipe, yolo_pose, holistic")
+        if self.depth_estimator_backend not in {"pixel", "midas"}:
+            raise ValueError("depth_estimator_backend must be one of: pixel, midas")
+        if self.depth_update_every_n_frames < 1:
+            raise ValueError("depth_update_every_n_frames must be >= 1")
 
     def normalize_target(self, label: str) -> str:
         label = label.strip().lower()

@@ -58,6 +58,24 @@ def estimate_distance_cm(dx: float, dy: float, cm_per_pixel: float) -> float:
     return round(pixel_distance * cm_per_pixel, 1)
 
 
+def calibrate_cm_per_pixel(bbox: tuple, real_width_cm: float) -> float | None:
+    """Estimate cm/pixel scale from a detected object's bounding box and its known real width.
+
+    This removes the dependency on a fixed camera-to-scene distance assumption.
+    Returns None if the bbox is too small or real_width_cm is not positive.
+    """
+    if real_width_cm <= 0:
+        return None
+    x1, y1, x2, y2 = bbox
+    bbox_w = x2 - x1
+    bbox_h = y2 - y1
+    # Use the longer dimension to be robust against partially-visible objects
+    ref_px = max(bbox_w, bbox_h)
+    if ref_px < 10:
+        return None
+    return real_width_cm / ref_px
+
+
 def distance_phrase(distance: float, near_threshold: float) -> str:
     if distance < near_threshold * WITHIN_REACH_RATIO:
         return "within reach"

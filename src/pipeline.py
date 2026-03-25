@@ -1,10 +1,14 @@
 import logging
+import time
 
 import cv2
 
 from audio import AudioGuide
-from detector import TargetDetector
+from benchmark import BenchmarkRecorder
+from depth_estimator import create_depth_estimator, next_depth_backend
+from detector import create_detector, next_detector_backend
 from geometry import (
+    calibrate_cm_per_pixel,
     distance_phrase,
     estimate_distance_cm,
     movement_instruction,
@@ -12,7 +16,7 @@ from geometry import (
     to_cardinal_direction,
     to_clock_direction,
 )
-from hand_tracker import HandTracker
+from hand_tracker import create_hand_tracker, next_hand_tracker_backend
 from nlu import SimpleNLU
 from phrases import (
     CHECKING,
@@ -53,8 +57,18 @@ class QuerySnapshotPipeline:
     def __init__(self, config):
         self.config = config
         self.current_target_label = None
-        self.detector = TargetDetector(config.yolo_model, config.target_labels, config.detection_confidence)
-        self.hand_tracker = HandTracker(config.hand_landmarker_model)
+        self.detector = create_detector(
+            config.detector_backend, config.target_labels, config.detection_confidence
+        )
+        self.hand_tracker = create_hand_tracker(
+            config.hand_tracker_backend, config.hand_landmarker_model
+        )
+        self.depth_estimator = create_depth_estimator(
+            config.depth_estimator_backend,
+            config.approx_cm_per_pixel,
+            config.depth_update_every_n_frames,
+        )
+        self.benchmark = BenchmarkRecorder()
         self.audio = AudioGuide(
             config.speech_cooldown_sec,
             enabled=config.use_tts,
@@ -123,11 +137,23 @@ class QuerySnapshotPipeline:
             for detection in detections[:RAW_DETECTION_LIMIT]
         )
 
+    def _effective_cm_per_pixel(self, target: dict) -> float:
+        """Return a dynamically calibrated cm/pixel scale if the target has a known real size,
+        otherwise fall back to the configured constant."""
+        label = target.get("label", "")
+        real_width = self.config.known_object_widths_cm.get(label)
+        if real_width:
+            scale = calibrate_cm_per_pixel(target["bbox"], real_width)
+            if scale:
+                return scale
+        return self.config.approx_cm_per_pixel
+
     def _direction_context(self, target, hand_center):
         tx, ty = target["center"]
         hx, hy = hand_center
         dx, dy = tx - hx, ty - hy
         manhattan = abs(dx) + abs(dy)
+        cm_per_px = self._effective_cm_per_pixel(target)
         return {
             "dx": dx,
             "dy": dy,
@@ -135,7 +161,7 @@ class QuerySnapshotPipeline:
             "clock": to_clock_direction(dx, dy),
             "cardinal": to_cardinal_direction(dx, dy, self.config.x_threshold, self.config.y_threshold),
             "movement": movement_instruction(dx, dy, self.config.x_threshold, self.config.y_threshold),
-            "approx_cm": estimate_distance_cm(dx, dy, self.config.approx_cm_per_pixel),
+            "approx_cm": estimate_distance_cm(dx, dy, cm_per_px),
             "distance": distance_phrase(manhattan, self.config.near_threshold),
         }
 
@@ -158,15 +184,50 @@ class QuerySnapshotPipeline:
         return (min(xs), min(ys), max(xs), max(ys))
 
     def update_live_state(self, frame):
+        # --- Object detection with timing ---
+        t0 = time.perf_counter()
         detections = self.detector.detect_all(frame, restrict_to_allowed=True)
+        det_ms = (time.perf_counter() - t0) * 1000
         detections = [
             detection
             for detection in detections
             if detection["label"] not in self.config.ignored_scene_labels
         ]
         detections = sorted(detections, key=lambda x: x["confidence"], reverse=True)
+        best_conf = detections[0]["confidence"] if detections else 0.0
+        self.benchmark.record_detection(
+            self.detector.backend_name, det_ms, bool(detections), best_conf
+        )
+
+        # --- Hand tracking with timing ---
+        t0 = time.perf_counter()
         hand_center, hand_landmarks = self.hand_tracker.detect(frame)
+        hand_ms = (time.perf_counter() - t0) * 1000
         hand_box = self._hand_box_from_landmarks(frame, hand_landmarks)
+        self.benchmark.record_hand_tracking(
+            self.hand_tracker.backend, hand_ms, hand_center is not None
+        )
+
+        # --- Depth estimation with timing ---
+        t0 = time.perf_counter()
+        self.depth_estimator.update(frame)
+        depth_ms = (time.perf_counter() - t0) * 1000
+        pixel_cm = 0.0
+        depth_cm = 0.0
+        if hand_center and detections:
+            target = self._best_target(detections, self.current_target_label) or detections[0]
+            pixel_cm = estimate_distance_cm(
+                target["center"][0] - hand_center[0],
+                target["center"][1] - hand_center[1],
+                self.config.approx_cm_per_pixel,
+            )
+            depth_cm = self.depth_estimator.estimate_distance_cm(
+                hand_center, target["center"], frame.shape
+            )
+        self.benchmark.record_depth(
+            self.depth_estimator.backend_name, depth_ms, pixel_cm, depth_cm
+        )
+        self.benchmark.commit_frame()
 
         self.live_detections = detections
         self.live_hand_center = hand_center
@@ -318,6 +379,7 @@ class QuerySnapshotPipeline:
         cv2.putText(display, f"Objects: {scene_text}", (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
         cv2.putText(display, f"Heard: {heard if heard else 'none'}", (20, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 120), 1)
         cv2.putText(display, f"Answer: {answer if answer else 'none'}", (20, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80, 220, 255), 1)
+        self._draw_benchmark_overlay(display)
         return display
 
     def _draw_hand_landmarks(self, frame, hand_landmarks):
@@ -336,6 +398,58 @@ class QuerySnapshotPipeline:
             if start_index >= len(points) or end_index >= len(points):
                 continue
             cv2.line(frame, points[start_index], points[end_index], (0, 180, 255), 2)
+
+    # ------------------------------------------------------------------
+    # Runtime backend switching
+    # ------------------------------------------------------------------
+
+    def cycle_detector(self) -> str:
+        """Switch to the next object detector backend and return its name."""
+        self.hand_tracker.close()  # not relevant but keep symmetry
+        next_backend = next_detector_backend(self.config.detector_backend)
+        self.config.detector_backend = next_backend
+        self.detector = create_detector(
+            next_backend, self.config.target_labels, self.config.detection_confidence
+        )
+        logger.info("Detector switched → %s", next_backend)
+        return next_backend
+
+    def cycle_hand_tracker(self) -> str:
+        """Switch to the next hand tracker backend and return its name."""
+        self.hand_tracker.close()
+        next_backend = next_hand_tracker_backend(self.config.hand_tracker_backend)
+        self.config.hand_tracker_backend = next_backend
+        self.hand_tracker = create_hand_tracker(next_backend, self.config.hand_landmarker_model)
+        logger.info("Hand tracker switched → %s", next_backend)
+        return next_backend
+
+    def cycle_depth_estimator(self) -> str:
+        """Switch to the next depth estimator backend and return its name."""
+        next_backend = next_depth_backend(self.config.depth_estimator_backend)
+        self.config.depth_estimator_backend = next_backend
+        self.depth_estimator = create_depth_estimator(
+            next_backend, self.config.approx_cm_per_pixel, self.config.depth_update_every_n_frames
+        )
+        logger.info("Depth estimator switched → %s", next_backend)
+        return next_backend
+
+    def save_benchmark(self, directory: str = "logs") -> str:
+        """Flush benchmark records to CSV and return the file path."""
+        return self.benchmark.save_csv(directory)
+
+    # ------------------------------------------------------------------
+    # Benchmark overlay drawing
+    # ------------------------------------------------------------------
+
+    def _draw_benchmark_overlay(self, frame):
+        lines = self.benchmark.overlay_lines()
+        x, y0 = 10, frame.shape[0] - 10 - len(lines) * 18
+        cv2.rectangle(frame, (x - 4, y0 - 14), (x + 300, y0 + len(lines) * 18), (20, 20, 20), -1)
+        for i, line in enumerate(lines):
+            cv2.putText(
+                frame, line, (x, y0 + i * 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1
+            )
 
     def close(self):
         self.hand_tracker.close()

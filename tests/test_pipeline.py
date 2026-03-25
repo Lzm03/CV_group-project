@@ -20,6 +20,8 @@ class DummyAudio:
 
 
 class DummyDetector:
+    backend_name = "dummy_detector"
+
     def __init__(self, *args, **kwargs):
         self.detections = []
 
@@ -28,6 +30,8 @@ class DummyDetector:
 
 
 class DummyHandTracker:
+    backend = "dummy_hand_tracker"
+
     def __init__(self, *args, **kwargs):
         self.center = None
         self.landmarks = None
@@ -41,6 +45,19 @@ class DummyHandTracker:
 
     def close(self):
         return None
+
+
+class DummyDepthEstimator:
+    backend_name = "dummy_depth"
+
+    def update(self, frame):
+        pass
+
+    def estimate_distance_cm(self, point_a, point_b, frame_shape):
+        import math
+        dx = point_b[0] - point_a[0]
+        dy = point_b[1] - point_a[1]
+        return round(math.hypot(dx, dy) * 0.18, 1)
 
 
 class DummySpeechInput:
@@ -58,8 +75,9 @@ class DummySpeechInput:
 @pytest.fixture
 def pipeline_factory(monkeypatch):
     monkeypatch.setattr(pipeline_module, "AudioGuide", DummyAudio)
-    monkeypatch.setattr(pipeline_module, "TargetDetector", DummyDetector)
-    monkeypatch.setattr(pipeline_module, "HandTracker", DummyHandTracker)
+    monkeypatch.setattr(pipeline_module, "create_detector", lambda *a, **kw: DummyDetector())
+    monkeypatch.setattr(pipeline_module, "create_hand_tracker", lambda *a, **kw: DummyHandTracker())
+    monkeypatch.setattr(pipeline_module, "create_depth_estimator", lambda *a, **kw: DummyDepthEstimator())
     monkeypatch.setattr(pipeline_module, "SpeechInput", DummySpeechInput)
     monkeypatch.setattr(pipeline_module, "pick", lambda options: options[0])
 

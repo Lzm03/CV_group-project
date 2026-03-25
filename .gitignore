@@ -9,3 +9,15 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# YOLO model files (large, can be retrained)
+src/*.pt
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+temp/

@@ -33,7 +33,7 @@ def main():
 
     pipeline = QuerySnapshotPipeline(config)
     pipeline.audio.speak(pick(OPENINGS))
-    logger.info("Controls: v=voice question, k=type question, q=quit")
+    logger.info("Controls: v=voice  k=type  q=quit  1=cycle detector  2=cycle hand-tracker  3=cycle depth  b=save benchmark")
     logger.info("Examples: 'What objects are in front of me?', 'I want to pick up the cup', 'Where is the cup?', 'Did I get the cup?'")
 
     try:
@@ -61,6 +61,19 @@ def main():
                 text = input("Type a command and press Enter: ").strip()
                 if text:
                     pipeline.handle_voice_text(text)
+            elif key == ord('1'):
+                name = pipeline.cycle_detector()
+                logger.info("Detector → %s", name)
+            elif key == ord('2'):
+                name = pipeline.cycle_hand_tracker()
+                logger.info("Hand tracker → %s", name)
+            elif key == ord('3'):
+                name = pipeline.cycle_depth_estimator()
+                logger.info("Depth estimator → %s", name)
+            elif key == ord('b'):
+                path = pipeline.save_benchmark()
+                if path:
+                    logger.info("Benchmark CSV saved: %s", path)
     finally:
         pipeline.close()
         cap.release()
