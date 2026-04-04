@@ -218,55 +218,93 @@ class YOLOPoseHandTracker(BaseHandTracker):
 
 
 class HolisticHandTracker(BaseHandTracker):
-    """Hand tracker using MediaPipe Holistic (full-body model, extracts hand landmarks)."""
+    """Hand tracker using MediaPipe HandLandmarker Tasks API (no pose dependency).
+
+    Uses the newer Tasks API for hand landmark detection, providing similar
+    functionality to the legacy mp.solutions.holistic when pose model is unavailable.
+    """
 
     def __init__(self):
-        self.holistic = None
+        self.hand_landmarker = None
         self.hand_connections = None
         self.available = False
         self.error_message = ""
         self.backend = "mediapipe_holistic"
+        self._last_timestamp_ms = 0
         try:
             import mediapipe as mp
+            from mediapipe.tasks import python as mp_tasks
+            from mediapipe.tasks.python import vision
             self.mp = mp
-            self.holistic = mp.solutions.holistic.Holistic(
-                static_image_mode=False,
-                min_detection_confidence=0.4,
+            self._vision = vision
+
+            # Load HandLandmarker using Tasks API
+            model_path = Path("hand_landmarker.task")
+            if not model_path.is_absolute():
+                project_root = Path(__file__).resolve().parent.parent
+                for base_dir in (project_root, Path(__file__).resolve().parent):
+                    resolved = base_dir / model_path
+                    if resolved.exists():
+                        model_path = resolved
+                        break
+            hand_options = vision.HandLandmarkerOptions(
+                base_options=mp_tasks.BaseOptions(model_asset_path=str(model_path)),
+                running_mode=vision.RunningMode.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=0.4,
+                min_hand_presence_confidence=0.4,
                 min_tracking_confidence=0.4,
             )
-            self.hand_connections = mp.solutions.hands.HAND_CONNECTIONS
+            self.hand_landmarker = vision.HandLandmarker.create_from_options(hand_options)
+            self.hand_connections = vision.HandLandmarksConnections.HAND_CONNECTIONS
             self.available = True
-            logger.info("MediaPipe Holistic loaded")
+            logger.info("MediaPipe Holistic (HandLandmarker Tasks API) loaded")
         except Exception as e:
             self.error_message = f"MediaPipe Holistic not ready: {e}"
             logger.warning(self.error_message)
 
+    def _next_timestamp_ms(self):
+        timestamp_ms = int(__import__("time").monotonic() * 1000)
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+        return timestamp_ms
+
     def detect(self, frame_bgr):
-        if self.holistic is None:
+        if self.hand_landmarker is None:
             return None, None
         try:
             frame_rgb = frame_bgr[:, :, ::-1]
-            results = self.holistic.process(frame_rgb)
-            hand_landmarks = results.right_hand_landmarks or results.left_hand_landmarks
-            if hand_landmarks is None:
+            image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=frame_rgb.copy())
+            hand_result = self.hand_landmarker.detect_for_video(image, self._next_timestamp_ms())
+
+            if not hand_result.hand_landmarks:
                 return None, None
+
+            raw = hand_result.hand_landmarks[0]
+            # Tasks API returns List[NormalizedLandmark]; legacy returns NormalizedLandmarkList with .landmark
             h, w = frame_bgr.shape[:2]
-            coords = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks.landmark]
+            if hasattr(raw, 'landmark'):
+                landmarks = raw.landmark
+            else:
+                landmarks = raw  # already a plain list
+            coords = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
             center_x = sum(p[0] for p in coords) // len(coords)
             center_y = sum(p[1] for p in coords) // len(coords)
+            # Wrap in SimpleNamespace so .landmark is available, matching MediaPipeHandTracker
+            hand_landmarks = SimpleNamespace(landmark=landmarks)
             return (center_x, center_y), hand_landmarks
         except Exception as e:
             logger.warning("Holistic hand tracking failed: %s", e)
             return None, None
 
     def close(self):
-        if self.holistic is None:
-            return
-        try:
-            self.holistic.close()
-        except Exception:
-            pass
-        self.holistic = None
+        if self.hand_landmarker:
+            try:
+                self.hand_landmarker.close()
+            except Exception:
+                pass
+            self.hand_landmarker = None
 
 
 # Backward-compatible alias
@@ -285,9 +323,17 @@ def create_hand_tracker(backend: str, model_path: str = "hand_landmarker.task") 
 
 
 def next_hand_tracker_backend(current: str) -> str:
-    """Return the next backend name in the cycle."""
+    """Return the next backend name in the cycle.
+
+    Strips the colon suffix from 'current' (e.g. 'mediapipe_tasks' -> 'mediapipe',
+    'yolo_pose:yolov8n-pose.pt' -> 'yolo_pose', 'mediapipe_holistic' -> 'mediapipe')
+    to match entries in _HAND_TRACKER_CYCLE.
+    """
+    base = current.split(":")[0].replace("mediapipe_holistic", "holistic")
+    if base not in _HAND_TRACKER_CYCLE:
+        base = "mediapipe"
     try:
-        idx = _HAND_TRACKER_CYCLE.index(current)
+        idx = _HAND_TRACKER_CYCLE.index(base)
     except ValueError:
         idx = 0
     return _HAND_TRACKER_CYCLE[(idx + 1) % len(_HAND_TRACKER_CYCLE)]
