@@ -20,7 +20,7 @@ class BaseDepthEstimator(ABC):
         """Ingest a new camera frame (may update internal depth map)."""
 
     @abstractmethod
-    def estimate_distance_cm(self, point_a: tuple, point_b: tuple, frame_shape: tuple) -> float:
+    def estimate_distance_cm(self, point_a: tuple, point_b: tuple, frame_shape: tuple, cm_per_pixel: float = 0.18) -> float:
         """Return estimated 3D distance in cm between two image-space points."""
 
 
@@ -35,10 +35,25 @@ class PixelDistanceEstimator(BaseDepthEstimator):
     def update(self, frame) -> None:
         pass  # stateless
 
-    def estimate_distance_cm(self, point_a: tuple, point_b: tuple, frame_shape: tuple) -> float:
+    def estimate_distance_cm(self, point_a: tuple, point_b: tuple, frame_shape: tuple, cm_per_pixel: float = 0.18) -> float:
         dx = float(point_b[0] - point_a[0])
         dy = float(point_b[1] - point_a[1])
-        return round(math.hypot(dx, dy) * self.cm_per_pixel, 1)
+        raw_cm = math.hypot(dx, dy) * cm_per_pixel
+        return round(raw_cm, 1)
+
+
+# Module-level cache: reuse loaded MiDaS model across instances
+_midas_cache: dict | None = None
+
+
+def _get_midas_cache():
+    """Return cached (model, transform, device) or None if not yet loaded."""
+    return _midas_cache
+
+
+def _set_midas_cache(model, transform, device):
+    global _midas_cache
+    _midas_cache = (model, transform, device)
 
 
 class MiDaSDepthEstimator(BaseDepthEstimator):
@@ -47,6 +62,9 @@ class MiDaSDepthEstimator(BaseDepthEstimator):
     Produces a relative inverse-depth map (higher = closer).  The depth
     component is combined with the 2-D pixel distance to give a rough 3-D
     distance estimate for comparison against the pixel-only baseline.
+
+    The model is cached at module level after first load and reused for
+    all subsequent instances, avoiding repeated torch.hub loading.
     """
 
     backend_name = "midas"
@@ -63,6 +81,14 @@ class MiDaSDepthEstimator(BaseDepthEstimator):
         self._init_model()
 
     def _init_model(self):
+        global _midas_cache
+        # Reuse cached model if already loaded
+        if _midas_cache is not None:
+            self._model, self._transform, self._device = _midas_cache
+            self.available = True
+            logger.info("MiDaS_small reuse from cache on %s", self._device)
+            return
+
         try:
             import torch
             self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,6 +101,7 @@ class MiDaSDepthEstimator(BaseDepthEstimator):
                 "intel-isl/MiDaS", "transforms", trust_repo=True, verbose=False
             )
             self._transform = transforms.small_transform
+            _set_midas_cache(self._model, self._transform, self._device)
             self.available = True
             logger.info("MiDaS_small loaded on %s", self._device)
         except Exception as e:
@@ -103,10 +130,10 @@ class MiDaSDepthEstimator(BaseDepthEstimator):
         except Exception as e:
             logger.warning("MiDaS update failed: %s", e)
 
-    def estimate_distance_cm(self, point_a: tuple, point_b: tuple, frame_shape: tuple) -> float:
+    def estimate_distance_cm(self, point_a: tuple, point_b: tuple, frame_shape: tuple, cm_per_pixel: float = 0.18) -> float:
         dx = float(point_b[0] - point_a[0])
         dy = float(point_b[1] - point_a[1])
-        dist_2d_cm = math.hypot(dx, dy) * self.cm_per_pixel
+        dist_2d_cm = math.hypot(dx, dy) * cm_per_pixel
 
         if self._depth_map is None or not self.available:
             return round(dist_2d_cm, 1)
@@ -127,13 +154,15 @@ class MiDaSDepthEstimator(BaseDepthEstimator):
         # Convert to "distance from camera" (0=close, 1=far)
         inv_a = 1.0 - norm_a
         inv_b = 1.0 - norm_b
-        # Scale depth diff to cm using a rough empirical factor (10× pixel scale)
-        depth_diff_cm = abs(inv_a - inv_b) * self.cm_per_pixel * 100.0
+        # Scale depth diff to cm using a rough empirical factor (10x pixel scale)
+        depth_diff_cm = abs(inv_a - inv_b) * cm_per_pixel * 100.0
         return round(math.hypot(dist_2d_cm, depth_diff_cm), 1)
 
 
 def create_depth_estimator(backend: str, cm_per_pixel: float = 0.18,
                            update_every_n_frames: int = 3) -> BaseDepthEstimator:
+    """Factory: create a depth estimator by backend name.
+    Note: cm_per_pixel here is a default; the pipeline passes dynamic calibrated values per frame."""
     """Factory: create a depth estimator by backend name."""
     if backend == "midas":
         return MiDaSDepthEstimator(cm_per_pixel, update_every_n_frames)
