@@ -26,7 +26,7 @@ Build a real-time demo that:
 - Rule-based guidance policy
 
 ## Project structure
-- `src/main.py` — app entry point
+- `run.py` — app entry point
 - `src/config.py` — app config and backend selection
 - `src/detector.py` — object detection (YOLO / SSD multi-backend)
 - `src/hand_tracker.py` — hand tracking (MediaPipe / YOLO-Pose / Holistic multi-backend)
@@ -35,7 +35,6 @@ Build a real-time demo that:
 - `src/guidance.py` — hand-to-object guidance logic
 - `src/audio.py` — speech output with anti-spam cooldown
 - `src/pipeline.py` — end-to-end frame processing
-- `docs/plan.md` — implementation roadmap
 - `requirements.txt` — Python dependencies
 
 ## Quick start
