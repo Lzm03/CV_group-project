@@ -170,12 +170,22 @@ TargetDetector = YOLODetector
 
 _DETECTOR_CYCLE = ["yolo11s", "yolo8n", "yolo8s", "yolo8m", "ssd"]
 
+# Alias map: canonical name → actual model file (local or Ultralytics hub name)
+_DETECTOR_ALIASES = {
+    "yolo8n": "yolov8n.pt",
+    "yolo8s": "yolov8s.pt",
+    "yolo8m": "yolov8m.pt",
+}
+
 
 def create_detector(backend: str, allowed_labels: tuple, confidence: float) -> BaseDetector:
     """Factory: create a detector by backend name."""
     if backend == "ssd":
         return SSDDetector(allowed_labels, confidence)
-    model_name = backend if backend.endswith(".pt") else f"{backend}.pt"
+    # Resolve aliases (yolo8n -> yolov8n.pt) to find local files
+    model_name = _DETECTOR_ALIASES.get(backend, backend)
+    if not model_name.endswith(".pt"):
+        model_name = f"{model_name}.pt"
     return YOLODetector(model_name, allowed_labels, confidence)
 
 
