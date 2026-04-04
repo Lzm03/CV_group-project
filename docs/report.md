@@ -371,7 +371,14 @@ Future work should explore continuous (non-query-driven) guidance, depth-aware t
 
 ## 10. Team Contributions
 
-*[To be filled by the team.]*
+| Name      | StudentID | Contributions                                                |
+| --------- | --------- | ------------------------------------------------------------ |
+| LI WEIPEI | 25064258G | Extended the single-mode CV system to support 30 combinable Backend/BackendHand/Tracker modes with key switching. I also implemented test coverage and completed benchmarking and distance validation across all combinations. |
+|           |           |                                                              |
+|           |           |                                                              |
+|           |           |                                                              |
+
+
 
 ---
 
