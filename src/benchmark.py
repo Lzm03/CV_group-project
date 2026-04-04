@@ -33,6 +33,8 @@ class BenchmarkRecorder:
         self._det_backend = "—"
         self._hand_backend = "—"
         self._depth_backend = "—"
+        self._pixel_dist_cm = 0.0
+        self._depth_dist_cm = 0.0
 
     def record_detection(self, backend: str, ms: float, found: bool, conf: float = 0.0) -> None:
         self._current.update(
@@ -62,6 +64,8 @@ class BenchmarkRecorder:
         )
         self._depth_ms = (1 - _EMA_ALPHA) * self._depth_ms + _EMA_ALPHA * ms
         self._depth_backend = backend
+        self._pixel_dist_cm = pixel_cm
+        self._depth_dist_cm = depth_cm
 
     def commit_frame(self) -> None:
         """Finalise the current frame's record and append to history."""
@@ -71,12 +75,18 @@ class BenchmarkRecorder:
         self._records.append(dict(self._current))
         self._current = {}
 
+    def reset(self) -> None:
+        """Clear all recorded frames. Call this when switching backends to start fresh."""
+        self._records.clear()
+        self._current = {}
+
     def overlay_lines(self) -> list[str]:
         """Return short status strings suitable for on-screen overlay."""
         return [
             f"[Det]  {self._det_backend:<10} {self._det_ms:5.1f} ms",
             f"[Hand] {self._hand_backend:<10} {self._hand_ms:5.1f} ms",
             f"[Dep]  {self._depth_backend:<10} {self._depth_ms:5.1f} ms",
+            f"[Dist] px={self._pixel_dist_cm:5.1f}cm  d={self._depth_dist_cm:5.1f}cm",
             f"[Rec]  {len(self._records)} frames",
         ]
 

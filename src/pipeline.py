@@ -216,13 +216,15 @@ class QuerySnapshotPipeline:
         depth_cm = 0.0
         if hand_center and detections:
             target = self._best_target(detections, self.current_target_label) or detections[0]
+            # Use dynamically calibrated cm_per_pixel based on target's known real size
+            cm_per_px = self._effective_cm_per_pixel(target)
             pixel_cm = estimate_distance_cm(
                 target["center"][0] - hand_center[0],
                 target["center"][1] - hand_center[1],
-                self.config.approx_cm_per_pixel,
+                cm_per_px,
             )
             depth_cm = self.depth_estimator.estimate_distance_cm(
-                hand_center, target["center"], frame.shape
+                hand_center, target["center"], frame.shape, cm_per_px
             )
         self.benchmark.record_depth(
             self.depth_estimator.backend_name, depth_ms, pixel_cm, depth_cm
@@ -405,13 +407,13 @@ class QuerySnapshotPipeline:
 
     def cycle_detector(self) -> str:
         """Switch to the next object detector backend and return its name."""
-        self.hand_tracker.close()  # not relevant but keep symmetry
         next_backend = next_detector_backend(self.config.detector_backend)
         self.config.detector_backend = next_backend
         self.detector = create_detector(
             next_backend, self.config.target_labels, self.config.detection_confidence
         )
-        logger.info("Detector switched → %s", next_backend)
+        self.benchmark.reset()
+        logger.info("Detector switched → %s (benchmark reset)", next_backend)
         return next_backend
 
     def cycle_hand_tracker(self) -> str:
@@ -420,7 +422,8 @@ class QuerySnapshotPipeline:
         next_backend = next_hand_tracker_backend(self.config.hand_tracker_backend)
         self.config.hand_tracker_backend = next_backend
         self.hand_tracker = create_hand_tracker(next_backend, self.config.hand_landmarker_model)
-        logger.info("Hand tracker switched → %s", next_backend)
+        self.benchmark.reset()
+        logger.info("Hand tracker switched → %s (benchmark reset)", next_backend)
         return next_backend
 
     def cycle_depth_estimator(self) -> str:
@@ -430,7 +433,8 @@ class QuerySnapshotPipeline:
         self.depth_estimator = create_depth_estimator(
             next_backend, self.config.approx_cm_per_pixel, self.config.depth_update_every_n_frames
         )
-        logger.info("Depth estimator switched → %s", next_backend)
+        self.benchmark.reset()
+        logger.info("Depth estimator switched → %s (benchmark reset)", next_backend)
         return next_backend
 
     def save_benchmark(self, directory: str = "logs") -> str:
