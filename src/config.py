@@ -29,7 +29,7 @@ class AppConfig:
     # Known real-world widths (cm) for bbox-based scale auto-calibration.
     # Objects not listed here fall back to approx_cm_per_pixel.
     known_object_widths_cm: dict[str, float] = field(default_factory=lambda: {
-        "cup": 8.5,         # typical mug diameter
+        "cup": 10,         # typical mug diameter
         "cell phone": 7.2,  # typical smartphone width
         "paper": 21.0,      # A4 width
     })

@@ -53,11 +53,11 @@ class DummyDepthEstimator:
     def update(self, frame):
         pass
 
-    def estimate_distance_cm(self, point_a, point_b, frame_shape):
+    def estimate_distance_cm(self, point_a, point_b, frame_shape, cm_per_pixel=0.18):
         import math
         dx = point_b[0] - point_a[0]
         dy = point_b[1] - point_a[1]
-        return round(math.hypot(dx, dy) * 0.18, 1)
+        return round(math.hypot(dx, dy) * cm_per_pixel, 1)
 
 
 class DummySpeechInput:
