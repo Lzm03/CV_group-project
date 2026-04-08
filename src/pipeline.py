@@ -263,29 +263,31 @@ class QuerySnapshotPipeline:
             msg = pick(SCENE_MANY).format(objects=objects_text)
         return self._respond(msg)
 
-    def answer_direction(self, target_label=None):
+    def answer_direction(self, target_label=None, e2e_ms: float | None = None):
         current_target = self._require_target_label(target_label)
         if current_target is None:
             return self.last_answer
 
         target = self._best_target(self.live_detections, current_target)
         if target is None:
-            return self._respond(pick(DIRECTION_NO_TARGET).format(target=current_target))
-        if self._hand_tracking_unavailable():
-            return self._respond(self._hand_tracking_message())
-        if self.live_hand_center is None:
-            return self._respond(pick(SHOW_HAND).format(target=current_target))
-
-        context = self._direction_context(target, self.live_hand_center)
-        msg = pick(DIRECTION_REPLY).format(
-            target=current_target,
-            clock=context["clock"],
-            cardinal=context["cardinal"],
-            movement=context["movement"],
-            approx_cm=context["approx_cm"],
-            distance=context["distance"],
-            follow=pick(FOLLOW_UP),
-        )
+            msg = pick(DIRECTION_NO_TARGET).format(target=current_target)
+        elif self._hand_tracking_unavailable():
+            msg = self._hand_tracking_message()
+        elif self.live_hand_center is None:
+            msg = pick(SHOW_HAND).format(target=current_target)
+        else:
+            context = self._direction_context(target, self.live_hand_center)
+            msg = pick(DIRECTION_REPLY).format(
+                target=current_target,
+                clock=context["clock"],
+                cardinal=context["cardinal"],
+                movement=context["movement"],
+                approx_cm=context["approx_cm"],
+                distance=context["distance"],
+                follow=pick(FOLLOW_UP),
+            )
+        if e2e_ms is not None:
+            msg = f"[E2E Latency: {e2e_ms:.0f}ms] {msg}"
         return self._respond(msg)
 
     def answer_grasp_status(self, target_label=None):
@@ -319,20 +321,22 @@ class QuerySnapshotPipeline:
         return self._respond(msg)
 
     def handle_voice_text(self, text):
+        t0 = time.perf_counter()
         self.last_heard_text = text or ""
         self.last_voice_status = "heard"
         logger.info("Heard: %s", self.last_heard_text)
         result = self.nlu.parse(text)
         self.audio.speak(pick(CHECKING))
+        e2e_ms = (time.perf_counter() - t0) * 1000
         if result.intent == "scene_summary":
             self.last_voice_status = "understood: scene_summary"
             return self.answer_scene_summary()
         if result.intent == "select_target":
             self.last_voice_status = f"understood: select_target ({result.target})"
-            return self.answer_direction(result.target)
+            return self.answer_direction(result.target, e2e_ms=e2e_ms)
         if result.intent == "ask_direction":
             self.last_voice_status = f"understood: ask_direction ({result.target})"
-            return self.answer_direction(result.target)
+            return self.answer_direction(result.target, e2e_ms=e2e_ms)
         if result.intent == "ask_grasp_status":
             self.last_voice_status = f"understood: ask_grasp_status ({result.target})"
             return self.answer_grasp_status(result.target)

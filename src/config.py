@@ -15,7 +15,7 @@ class AppConfig:
     stable_frames_required: int = 4
     approx_cm_per_pixel: float = 0.18
     speech_cooldown_sec: float = 1.2
-    speech_input_seconds: float = 6.0
+    speech_input_seconds: float = 5.0
     window_name: str = "Vision-Assisted Grasping MVP"
     use_tts: bool = True
     tts_provider: str = "auto"  # auto | pyttsx3 | minimax | say
